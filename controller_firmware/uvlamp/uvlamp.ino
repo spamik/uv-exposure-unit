@@ -1,7 +1,6 @@
 #include <Bounce2.h>
 #include <U8g2lib.h>
-
-
+#include <EEPROM.h>
 
 #define MAX_MENUITEM_LENGTH 10
 #define MENUITEM_LEFT_MARGIN 20
@@ -11,6 +10,7 @@
 #define REGIONS_Y1 28
 #define REGIONS_Y2 44
 #define BLINKING_INTERVAL 350
+#define EEPROM_MAGIC_BYTE 0xcafe
 
 // Pins definitons
 #define PIN_KEYBOARD_1 A0
@@ -23,6 +23,7 @@
 #define PIN_UVLEDARR_4 6
 #define PIN_BUZZER A4
 #define PIN_UVSIGNAL 4
+#define PIN_TAMPER A5
 
 // types
 struct TimerDecomposition {
@@ -74,6 +75,7 @@ Bounce dbKey1 = Bounce();
 Bounce dbKey2 = Bounce();
 Bounce dbKey3 = Bounce();
 Bounce dbKey4 = Bounce();
+Bounce dbTamper = Bounce();
 
 // system status
 bool uvlampOn = false;
@@ -83,14 +85,14 @@ unsigned long timerStart = 0;
 
 // system settings
 int uvPowerPercent = 100;
-int uvPower = ceil(uvPowerPercent / 100.0 * 255);
+int uvPower = 255; // real value from PWM, but derivated from EEPROM saved //ceil(uvPowerPercent / 100.0 * 255);
 bool uvRegion1 = true;
 bool uvRegion2 = true;
 bool uvRegion3 = true;
 bool uvRegion4 = true;
-int timer1 = 61;
-int timer2 = 122;
-int timer3 = 191;
+int timer1 = 60;
+int timer2 = 120;
+int timer3 = 180;
 
 // editing settings
 int uvPowerPercentSettings = uvPowerPercent;
@@ -105,6 +107,28 @@ bool blinkVisible = true;
 unsigned long lastBlinkTime = 0;
 int timerScreenPosition = 0;
 
+// melodies
+// when timer finishes
+int MELODY_TONES_FINAL_COUNTDOWN[] = {1000, 1000, 1000, 1000};
+int MELODY_DURATION_FINAL_COUNTDOWN[] = {300, 300, 300, 300};
+int MELODY_PAUSES_FINAL_COUNTDOWN[] = {200, 200, 200, 0};
+int MELODY_SIZE_FINAL_COUNTDOWN = 4;
+
+// when UV light is forced to off
+int MELODY_TONES_FORCEOFF[] = {250};
+int MELODY_DURATION_FORCEOFF[] = {1000};
+int MELODY_PAUSES_FORCEOFF[] = {0};
+int MELODY_SIZE_FORCEOFF = 1;
+
+// melody states
+bool activeMelody = false;
+int * melodyTones;
+int * melodyDuration;
+int * melodyPauses;
+int melodySize = 0;
+unsigned long melodyLastStart = 0;
+int melodyCurrentState = 0;
+int melodyPosition = 0;
 
 
 U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R2);
@@ -115,6 +139,7 @@ void setup() {
   pinMode(PIN_KEYBOARD_2, INPUT);
   pinMode(PIN_KEYBOARD_3, INPUT);
   pinMode(PIN_KEYBOARD_4, INPUT);
+  pinMode(PIN_TAMPER, INPUT);
   pinMode(PIN_UVLEDARR_1, OUTPUT);
   pinMode(PIN_UVLEDARR_2, OUTPUT);
   pinMode(PIN_UVLEDARR_3, OUTPUT);
@@ -131,25 +156,29 @@ void setup() {
   dbKey3.interval(DEBOUNCE_INTERVAL);
   dbKey4.attach(PIN_KEYBOARD_4);
   dbKey4.interval(DEBOUNCE_INTERVAL);
+  dbTamper.attach(PIN_TAMPER);
+  dbTamper.interval(DEBOUNCE_INTERVAL);
 
   // menu setup
   activeMenuItem = 0;
   activeScreen = BASE_MENU_ID;
   currentMenuSize = BASE_MENU_SIZE;
 
+  // load settings
+  loadEEPROMSettings();
+
   // reload timer menu
   updateTimerMenu();
 
   // display library init
   u8g2.begin();
-
 }
 
 void loop() {
   updateBouncers();
-
-  updateTimerMenu();
-
+  if (activeMelody) {
+    melodyLoop();
+  }
   // menu update
   u8g2.firstPage();
   do {
@@ -175,9 +204,43 @@ void loop() {
       case SET_TIMER_SCREEN_ID:
         drawSetTimer();
         break;
+      case TIMER_SCREEN_ID:
+        drawTimer();
+        break;
     }
            
   } while ( u8g2.nextPage() );
+}
+
+void melodyLoop() {
+  // changing state of buzzer to play selected melody
+  switch (melodyCurrentState) {
+    case 0:
+      // start playing new tone
+      tone(PIN_BUZZER, *(melodyTones+melodyPosition));
+      melodyLastStart = millis();
+      melodyCurrentState = 1;
+      break;
+    case 1:
+      // playing tone, waiting for duration to turn it off
+      if (melodyLastStart + *(melodyDuration+melodyPosition) <= millis()) {
+        noTone(PIN_BUZZER);
+        melodyLastStart = millis();
+        melodyCurrentState = 2;
+      }
+      break;
+    case 2:
+      // pause between next tone
+      if (melodyLastStart + *(melodyPauses+melodyPosition) <= millis()) {
+        melodyPosition++;
+        melodyCurrentState = 0;
+        if (melodyPosition == melodySize) {
+          // end of melody
+          activeMelody = false;
+        }
+      }
+      break;
+  }
 }
 
 void drawMenu(char ** menu, int menu_size, int active) {
@@ -213,7 +276,7 @@ void drawPowerSettings() {
   u8g2.drawStr(0, 12, "Current power:");
   u8g2.setFont(u8g2_font_inb24_mr);
   char powerStr[4];
-  sprintf(powerStr, "%d", uvPowerPercent);
+  sprintf(powerStr, "%d", uvPowerPercentSettings);
   u8g2.drawStr(32, 45, powerStr);
   u8g2.setFont(u8g2_font_helvB12_tr);
   u8g2.drawStr(0, 64, "<     -     +    Set");
@@ -253,9 +316,34 @@ void drawRegionSettings() {
   u8g2.drawStr(0, 64, legend);
 }
 
+void drawTimer() {
+  // draw current timer
+  if (!uvlampOn) {
+    // lamp is off, maybe tamper switch? go back to main menu, nothing more
+    goMainMenu();
+    return;
+  }
+  int timerLeft = activeTimer - (millis() - timerStart)/1000;
+  if (timerLeft <= 0) {
+    // timer is over, turn off lamp, play melody, go back to main menu
+    uvlampTurnOff();
+    playMelodyCountdown();
+    goMainMenu();
+    return;
+  }
+  // draw left time
+  char timerStr[6];
+  timerString(timerLeft, (char *) timerStr);
+  u8g2.setFont(u8g2_font_inb24_mr);
+  u8g2.drawStr(10, 24, (char *) timerStr);
+
+  // legend
+  u8g2.setFont(u8g2_font_helvB12_tr);
+  u8g2.drawStr(0, 64, "Cancel");
+}
+
 void drawSetTimer() {
   u8g2.setFont(u8g2_font_inb24_mr);
-  //u8g2.setFont(u8g2_font_freedoomr25_tn);
 
   TimerDecomposition dt = decompositeSeconds(activeTimer);
 
@@ -319,6 +407,7 @@ void updateBouncers() {
   dbKey2.update();
   dbKey3.update();
   dbKey4.update();
+  dbTamper.update();
 
   if (dbKey1.rose()) {
     backKeyPress();
@@ -331,6 +420,18 @@ void updateBouncers() {
   }
   if (dbKey4.rose()) {
     setKeyPress();
+  }
+  if (dbTamper.fell()) {
+    tamperOpen();
+  }
+}
+
+void tamperOpen() {
+  // tamper switch has opened
+  if (uvlampOn) {
+    // uvlamp is on and tamper failed - turn off
+    uvlampTurnOff();
+    playMelodyForceoff();
   }
 }
 
@@ -350,6 +451,9 @@ void backKeyPress() {
         break;
       case SET_TIMER_SCREEN_ID:
         timerSetBackKey();
+        break;
+      case TIMER_SCREEN_ID:
+        timerBackKey();
         break;
     }
   }
@@ -431,7 +535,7 @@ void menuSelection(bool setkey) {
             // timer menu
             activeScreen = TIMER_MENU_ID;
             activeMenuItem = 0;
-            currentMenuSize = 3;
+            currentMenuSize = TIMER_MENU_SIZE;
             break;
           case 1:
             // uv manual
@@ -530,6 +634,12 @@ void uvmanualScreenBackKey() {
 
 void uvlampTurnOn() {
   // turn on UV lamp
+
+  if (dbTamper.read() == LOW) {
+    // cover not closed - play sound and return
+    playMelodyForceoff();
+    return;
+  }
   
   // signal light
   digitalWrite(PIN_UVSIGNAL, HIGH);
@@ -584,6 +694,7 @@ void powerSettingsSetKey() {
   // set current power settings and go back to settings menu
   uvPowerPercent = uvPowerPercentSettings;
   uvPower = ceil(uvPowerPercent / 100.0 * 255);
+  saveEEPROMSettings(); // save to EEPROM
   goSettingsMenu();
 }
 
@@ -616,6 +727,7 @@ void uvRegionsSetKey() {
   uvRegion2 = uvRegion2Settings;
   uvRegion3 = uvRegion3Settings;
   uvRegion4 = uvRegion4Settings;
+  saveEEPROMSettings(); // save to EEPROM
   goSettingsMenu();
 }
 
@@ -686,7 +798,44 @@ void timerSetDownKey() {
 }
 
 void timerSetSetKey() {
-  
+  if (timerScreenPosition == 5) {
+    // go back to timer menu
+    activeScreen = TIMER_MENU_ID;
+    activeMenuItem = 0;
+    currentMenuSize = TIMER_MENU_SIZE;
+  }
+  else {
+    // run timer
+    uvlampTurnOn();
+    if (!uvlampOn) {
+      // we tried to turn on UV lamp but it's not
+      // probably tamper? exit for now
+      return;
+    }
+    switch (activeMenuItem) {
+      // rewrite memorized timer
+      case 0:
+        timer1 = activeTimer;
+        break;
+      case 1:
+        timer2 = activeTimer;
+        break;
+      case 2:
+        timer3 = activeTimer;
+        break;
+    }
+    updateTimerMenu();
+    saveEEPROMSettings();
+    timerStart = millis();
+    activeScreen = TIMER_SCREEN_ID;
+  }
+}
+
+void timerBackKey() {
+  // cancel current timer
+  uvlampTurnOff();
+  playMelodyForceoff();
+  goMainMenu();
 }
 
 TimerDecomposition decompositeSeconds(int seconds) {
@@ -710,20 +859,93 @@ void timerString(int timer, char * output) {
 
 void updateTimerMenu() {
   // update string in menu timer (with actual timer value)
-  //timer1Str = "";
   timerString(timer1, timer1Str);  
-  //timer2Str = "";
   timerString(timer2, timer2Str);  
-  //timer3Str = "";
   timerString(timer3, timer3Str);
-  //strcat(timer1Str, timerString(timer1));
   strcat(timer1Str, " (adjust)");
-  //strcat(timer2Str, timerString(timer2));
   strcat(timer2Str, " (adjust)");
-  //strcat(timer3Str, timerString(timer3));
   strcat(timer3Str, " (adjust)");
   TIMER_MENU[0] = (char *) timer1Str;
   TIMER_MENU[1] = (char *) timer2Str;
   TIMER_MENU[2] = (char *) timer3Str;
+}
+
+void playMelodyCountdown() {
+  // play melody on finishing countdown
+  melodyTones = MELODY_TONES_FINAL_COUNTDOWN;
+  melodyDuration = MELODY_DURATION_FINAL_COUNTDOWN;
+  melodyPauses = MELODY_PAUSES_FINAL_COUNTDOWN;
+  melodySize = MELODY_SIZE_FINAL_COUNTDOWN;
+  melodyCurrentState = 0;
+  melodyPosition = 0;
+  activeMelody = true;
+}
+
+void playMelodyForceoff() {
+  // melody on force UV off
+  melodyTones = MELODY_TONES_FORCEOFF;
+  melodyDuration = MELODY_DURATION_FORCEOFF;
+  melodyPauses = MELODY_PAUSES_FINAL_COUNTDOWN;
+  melodySize = MELODY_SIZE_FORCEOFF;
+  melodyCurrentState = 0;
+  melodyPosition = 0;
+  activeMelody = true;
+}
+
+void loadEEPROMSettings() {
+  // load settings from EEPROM
+  int address = 0;
+  int magicConst;
+  EEPROM.get(address, magicConst);
+  if (magicConst != EEPROM_MAGIC_BYTE) {
+    // unknown EEPROM, maybe wasn't ever saved. Save settings first
+    saveEEPROMSettings();
+  }
+  address += sizeof(int);
+  
+  EEPROM.get(address, uvPowerPercent);
+  uvPower = ceil(uvPowerPercent / 100.0 * 255);
+  address += sizeof(int);
+
+  EEPROM.get(address, uvRegion1);
+  address += sizeof(bool);
+  EEPROM.get(address, uvRegion2);
+  address += sizeof(bool);
+  EEPROM.get(address, uvRegion3);
+  address += sizeof(bool);
+  EEPROM.get(address, uvRegion4);
+  address += sizeof(bool);
+
+  EEPROM.get(address, timer1);
+  address += sizeof(int);
+  EEPROM.get(address, timer2);
+  address += sizeof(int);
+  EEPROM.get(address, timer3);
+}
+
+void saveEEPROMSettings() {
+  // save settings to EEPROM
+  int address = 0;
+  int magicConst = EEPROM_MAGIC_BYTE;
+  EEPROM.put(address, magicConst);
+  address += sizeof(int);
+
+  EEPROM.put(address, uvPowerPercent);
+  address += sizeof(int);
+
+  EEPROM.put(address, uvRegion1);
+  address += sizeof(bool);
+  EEPROM.put(address, uvRegion2);
+  address += sizeof(bool);
+  EEPROM.put(address, uvRegion3);
+  address += sizeof(bool);
+  EEPROM.put(address, uvRegion4);
+  address += sizeof(bool);
+
+  EEPROM.put(address, timer1);
+  address += sizeof(int);
+  EEPROM.put(address, timer2);
+  address += sizeof(int);
+  EEPROM.put(address, timer3);
 }
 
