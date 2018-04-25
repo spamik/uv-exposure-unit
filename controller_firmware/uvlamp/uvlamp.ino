@@ -13,16 +13,16 @@
 #define EEPROM_MAGIC_BYTE 0xcafe
 
 // Pins definitons
-#define PIN_KEYBOARD_1 A0
-#define PIN_KEYBOARD_2 A1
-#define PIN_KEYBOARD_3 A2
-#define PIN_KEYBOARD_4 A3
+#define PIN_KEYBOARD_1 A2
+#define PIN_KEYBOARD_2 A3
+#define PIN_KEYBOARD_3 A0
+#define PIN_KEYBOARD_4 A1
 #define PIN_UVLEDARR_1 11
 #define PIN_UVLEDARR_2 10
 #define PIN_UVLEDARR_3 9
 #define PIN_UVLEDARR_4 6
-#define PIN_BUZZER A4
-#define PIN_UVSIGNAL 4
+#define PIN_BUZZER 4
+#define PIN_UVSIGNAL A4
 #define PIN_TAMPER A5
 
 // types
