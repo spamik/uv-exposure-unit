@@ -1,0 +1,17 @@
+Screws:
+M2 x 6mm: 1
+M3 x 12mm: 56
+M3 x 12/14mm DIN 967: 4
+M3 x 18mm: 34
+M3 x 30mm: 4
+
+Nuts:
+M2: 1
+M3: 94
+M3 nyloc: 4
+
+Washers:
+M2: 1
+M3: 148
+
+Incomplete!!!
